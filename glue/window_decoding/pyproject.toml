@@ -1,0 +1,12 @@
+[project]
+name = "window-decoding"
+version = "0.1.0"
+description = "Forward sliding window decoder for rotated surface codes"
+requires-python = ">=3.11"
+dependencies = [
+    "stim",
+    "pymatching",
+    "numpy",
+    "matplotlib",
+    "jupyter",
+]
