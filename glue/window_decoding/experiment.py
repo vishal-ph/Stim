@@ -98,13 +98,13 @@ def run_full_decode(
 
 def _build_edge_obs_lookup(
     matcher: "pymatching.Matching",
-) -> dict[tuple[int, int], bool]:
-    """Build edge -> L0 observable lookup from PyMatching's internal graph.
+) -> dict[tuple[int, int], set[int]]:
+    """Build edge -> observable-set lookup from PyMatching's internal graph.
 
     PyMatching may combine parallel edges using probability-weighted rules
     that differ from naive XOR of the DEM's observable labels.  To ensure
-    the per-edge L0 labels match what the decoder actually uses, we read
-    them directly from ``matcher.edges()``.
+    the per-edge observable labels match what the decoder actually uses, we
+    read them directly from ``matcher.edges()``.
 
     The virtual boundary node is represented as ``-1``.  Both orderings
     ``(u, v)`` and ``(v, u)`` are stored for convenient lookup.
@@ -113,16 +113,16 @@ def _build_edge_obs_lookup(
         matcher: A constructed PyMatching ``Matching`` object.
 
     Returns:
-        Dict mapping ``(u, v)`` detector-index pairs to ``True`` if the
-        edge carries the L0 (logical observable 0) label.
+        Dict mapping ``(u, v)`` detector-index pairs to the set of
+        observable indices the edge carries.
     """
 
-    edge_obs: dict[tuple[int, int], bool] = {}
+    edge_obs: dict[tuple[int, int], set[int]] = {}
     for u, v, data in matcher.edges():
-        has_l0 = 0 in data["fault_ids"]
+        obs_set = set(data["fault_ids"])
         v_key = -1 if v is None else v
-        edge_obs[(u, v_key)] = has_l0
-        edge_obs[(v_key, u)] = has_l0
+        edge_obs[(u, v_key)] = obs_set
+        edge_obs[(v_key, u)] = obs_set
     return edge_obs
 
 
@@ -132,6 +132,7 @@ def run_sliding_window_decode(
     distance: int,
     n_com: int | None = None,
     n_buf: int | None = None,
+    num_observables: int | None = None,
 ) -> np.ndarray:
     """Decode detection events using the forward sliding-window algorithm.
 
@@ -166,9 +167,10 @@ def run_sliding_window_decode(
          committed.
 
        - *Cross-boundary edges* (C x B): one endpoint in commit, one
-         in buffer.  These are **not** committed for L0.  Instead, an
-         artificial defect is created at the buffer-side endpoint (see
-         step 5).
+         in buffer.  Their observable contributions **are** committed
+         (the closed-past-boundary rule prevents double-counting in
+         the next window).  An artificial defect is created at the
+         buffer-side endpoint (see step 5).
 
        - *Buffer edges* (B x B or B x boundary): both non-boundary
          endpoints are in the buffer region.  **Discarded** -- the next
@@ -195,11 +197,13 @@ def run_sliding_window_decode(
             ``n_com`` and ``n_buf`` if they are not specified.
         n_com: Number of commit rounds per window.  Defaults to ``d``.
         n_buf: Number of buffer rounds per window.  Defaults to ``d``.
-        seed: Optional random seed for detection events
-            simulation reproducibility.
+        num_observables: Number of logical observables.  If ``None``,
+            inferred from the DEM's error instructions (falls back to 1
+            if no observable labels are found, e.g. for zero-noise DEMs).
 
     Returns:
-        Bool array ``[shots x 1]`` of predicted logical observable flips.
+        Bool array ``[shots x num_observables]`` of predicted logical
+        observable flips.
     """
     import pymatching
 
@@ -211,18 +215,38 @@ def run_sliding_window_decode(
     if n_buf is None:
         n_buf = distance
 
-    # Map each detector to its syndrome round
-    by_round = group_detectors_by_round(full_dem)
-    if not by_round:
-        return np.zeros((shots, 1), dtype=bool)
+    # Determine number of observables from the full DEM
+    if num_observables is not None:
+        num_obs = num_observables
+    else:
+        num_obs = 0
+        for inst in full_dem.flattened():
+            if inst.type == "error":
+                for t in inst.targets_copy():
+                    if t.is_logical_observable_id():
+                        num_obs = max(num_obs, t.val + 1)
+        num_obs = max(num_obs, 1)
 
-    total_rounds = max(by_round.keys()) + 1
+    # Map each detector to its syndrome round.
+    # Remap sparse round keys (e.g. 9, 17, 25, ...) to consecutive
+    # integers (0, 1, 2, ...) so that n_com and n_buf refer to actual
+    # detector rounds rather than raw time-coordinate units.
+    by_round_raw = group_detectors_by_round(full_dem)
+    if not by_round_raw:
+        return np.zeros((shots, num_obs), dtype=bool)
+
+    sorted_round_keys = sorted(by_round_raw.keys())
+    by_round: dict[int, list[int]] = {}
+    for seq_idx, raw_key in enumerate(sorted_round_keys):
+        by_round[seq_idx] = by_round_raw[raw_key]
+
+    total_rounds = len(sorted_round_keys)
 
     # Window count: the last window's buffer extends to the end of the
     # circuit, so we need (num_windows - 1) * d + 2d >= total_rounds.
     num_windows = max(1, math.ceil((total_rounds - n_buf) / n_com))
 
-    final_prediction = np.zeros(shots, dtype=bool)
+    final_prediction = np.zeros((shots, num_obs), dtype=bool)
 
     # Per-shot list of GLOBAL detector indices inherited as artificial
     # defects from the previous window's committed C x B edges.
@@ -301,7 +325,7 @@ def run_sliding_window_decode(
                 continue
 
             edges = matcher.decode_to_edges_array(syndrome)
-            obs_flip = False
+            obs_flip = np.zeros(num_obs, dtype=bool)
 
             for edge in edges:
                 u, v = int(edge[0]), int(edge[1])
@@ -319,10 +343,15 @@ def run_sliding_window_decode(
                     continue
 
                 if u_in_buffer or v_in_buffer:
-                    # Cross-boundary edge (C x B): do NOT commit L0.
-                    # Create artificial defect at the buffer-side
-                    # endpoint.  The next window will see this defect
-                    # and freely match it.
+                    # Cross-boundary edge (C x B): commit observable
+                    # contributions and create artificial defect at the
+                    # buffer-side endpoint.  The closed-past-boundary
+                    # rule in subsequent windows prevents double-counting
+                    # (the same error mechanism is dropped because its
+                    # commit-side detector falls in the past region).
+                    for obs_idx in edge_obs.get((u, v), set()):
+                        if obs_idx < num_obs:
+                            obs_flip[obs_idx] = not obs_flip[obs_idx]
                     if u_in_buffer:
                         new_artificial[shot].append(window_dets[u])
                     if v_in_buffer:
@@ -330,16 +359,16 @@ def run_sliding_window_decode(
                     continue
 
                 # Commit-internal edge (C x C or C x boundary):
-                # commit its L0 contribution.
-                if edge_obs.get((u, v), False):
-                    obs_flip = not obs_flip
+                # commit its observable contributions.
+                for obs_idx in edge_obs.get((u, v), set()):
+                    if obs_idx < num_obs:
+                        obs_flip[obs_idx] = not obs_flip[obs_idx]
 
-            if obs_flip:
-                final_prediction[shot] = not final_prediction[shot]
+            final_prediction[shot] ^= obs_flip
 
         artificial_defects = new_artificial
 
-    return final_prediction.reshape(-1, 1)
+    return final_prediction
 
 
 # ---------------------------------------------------------------------------
@@ -355,16 +384,19 @@ def run_experiment(
     n_com: int | None = None,
     n_buf: int | None = None,
     code: str = "surface_code:rotated_memory_z",
+    circuit: stim.Circuit | None = None,
     verbose: bool = True,
     seed: int = 1234,
 ) -> ExperimentResult:
     """Run a single sliding-window vs full-circuit decoding comparison.
 
-    Generates a rotated surface code memory-Z circuit, samples detection
-    events, decodes with both the full-circuit baseline and the sliding
-    window decoder, and reports the logical error rates.
+    Generates a rotated surface code memory-Z circuit (or uses a provided
+    circuit), samples detection events, decodes with both the full-circuit
+    baseline and the sliding window decoder, and reports the logical error
+    rates.
 
-    The total number of syndrome rounds is computed automatically::
+    When no ``circuit`` is provided, the total number of syndrome rounds
+    is computed automatically::
 
         total_rounds = num_windows * n_com + n_buf
 
@@ -375,10 +407,15 @@ def run_experiment(
         distance: Code distance ``d``.
         num_windows: Number of decoding windows.
         noise: Depolarization rate (``after_clifford_depolarization``).
+            Only used when generating a circuit (i.e., ``circuit`` is None).
         shots: Number of Monte Carlo shots.
         n_com: Number of commit rounds per window.  Defaults to ``d``.
         n_buf: Number of buffer rounds per window.  Defaults to ``d``.
-        code: Stim code task string.
+        code: Stim code task string.  Only used when ``circuit`` is None.
+        circuit: An arbitrary ``stim.Circuit`` to decode.  When provided,
+            ``code``, ``noise``, and ``num_windows`` are ignored for
+            circuit generation, and ``total_rounds`` is inferred from
+            detector coordinates.
         verbose: If True, print progress to stdout.
         seed: Optional random seed for sampling reproducibility.
 
@@ -392,22 +429,27 @@ def run_experiment(
     if n_buf is None:
         n_buf = distance
 
-    total_rounds = num_windows * n_com + n_buf
+    if circuit is not None:
+        full_circuit = circuit
+        full_dem = full_circuit.detector_error_model(decompose_errors=True)
+        by_round = group_detectors_by_round(full_dem)
+        total_rounds = len(by_round) if by_round else 0
+    else:
+        total_rounds = num_windows * n_com + n_buf
+        full_circuit = stim.Circuit.generated(
+            code,
+            distance=distance,
+            rounds=total_rounds,
+            after_clifford_depolarization=noise,
+        )
+        full_dem = full_circuit.detector_error_model(decompose_errors=True)
 
     if verbose:
         print(
-            f"Experiment: d={distance}, windows={num_windows}, "
+            f"Experiment: d={distance}, "
             f"rounds={total_rounds}, window={n_com}+{n_buf}={n_com + n_buf}, "
             f"p={noise}, shots={shots}"
         )
-
-    full_circuit = stim.Circuit.generated(
-        code,
-        distance=distance,
-        rounds=total_rounds,
-        after_clifford_depolarization=noise,
-    )
-    full_dem = full_circuit.detector_error_model(decompose_errors=True)
 
     # --- Full-circuit baseline ---
     det_events, obs_actual, full_predictions = run_full_decode(full_dem, shots, seed)
@@ -423,6 +465,7 @@ def run_experiment(
         distance=distance,
         n_com=n_com,
         n_buf=n_buf,
+        num_observables=full_circuit.num_observables,
     )
     sliding_error_rate = float(
         np.mean(np.any(sliding_predictions != obs_actual, axis=1))
@@ -577,19 +620,81 @@ def print_results_table(results: list[ExperimentResult]) -> None:
         )
 
 
+def run_surgery_experiment(
+    distance: int = 3,
+    r_pre: int = 3,
+    r_merge: int = 3,
+    r_post: int = 3,
+    noise: float = 0.001,
+    shots: int = 10_000,
+    n_com: int | None = None,
+    n_buf: int | None = None,
+    verbose: bool = True,
+    seed: int = 1234,
+) -> ExperimentResult:
+    """Run a sliding-window vs full-circuit comparison on a merge-split circuit.
+
+    Builds a two-patch rotated surface code merge-split circuit via
+    :func:`~glue.window_decoding.lattice_surgery_circuits.build_merge_split_circuit`,
+    then decodes with both full-circuit MWPM and the sliding window
+    decoder.
+
+    Args:
+        distance: Code distance ``d`` for each patch.
+        r_pre: Pre-merge syndrome rounds.
+        r_merge: Merged syndrome rounds.
+        r_post: Post-split syndrome rounds.
+        noise: Depolarization rate.
+        shots: Monte Carlo shots.
+        n_com: Commit rounds per window.  Defaults to ``d``.
+        n_buf: Buffer rounds per window.  Defaults to ``d + 1`` (extra
+            round helps cover merge/split boundary effects).
+        verbose: Print progress.
+        seed: Random seed.
+
+    Returns:
+        An ``ExperimentResult`` with both error rates.
+    """
+    from glue.window_decoding.lattice_surgery_circuits import build_merge_split_circuit
+
+    if n_com is None:
+        n_com = distance
+    if n_buf is None:
+        n_buf = distance + 1
+
+    circuit = build_merge_split_circuit(
+        distance=distance,
+        r_pre=r_pre,
+        r_merge=r_merge,
+        r_post=r_post,
+        noise=noise,
+    )
+
+    return run_experiment(
+        distance=distance,
+        noise=noise,
+        shots=shots,
+        n_com=n_com,
+        n_buf=n_buf,
+        circuit=circuit,
+        verbose=verbose,
+        seed=seed,
+    )
+
+
 if __name__ == "__main__":
     print("=== Sliding Window Decoding Experiment ===")
     print("    Skoric et al., arXiv:2209.08552 (2023)\n")
 
     # Sanity check: zero noise must produce zero errors
-    print("--- Sanity check (zero noise) ---")
+    print("--- Sanity check (zero noise, memory) ---")
     result = run_experiment(distance=3, num_windows=2, noise=0.0, shots=1000)
     assert result.full_error_rate == 0.0
     assert result.sliding_window_error_rate == 0.0
     print("  PASSED\n")
 
     # Main sweep
-    print("--- Parameter sweep ---")
+    print("--- Parameter sweep (memory) ---")
     results = run_sweep(
         distances=[3, 5],
         num_windows_list=[2, 4, 8],
@@ -597,5 +702,30 @@ if __name__ == "__main__":
         shots=10_000,
     )
 
-    print("\n=== Results Summary ===")
+    print("\n=== Memory Results Summary ===")
     print_results_table(results)
+
+    # Lattice surgery sanity check
+    print("\n--- Sanity check (zero noise, surgery) ---")
+    result = run_surgery_experiment(
+        distance=3, r_pre=3, r_merge=3, r_post=3,
+        noise=0.0, shots=1000,
+    )
+    assert result.full_error_rate == 0.0
+    assert result.sliding_window_error_rate == 0.0
+    print("  PASSED\n")
+
+    # Lattice surgery noisy test
+    print("--- Lattice surgery experiment ---")
+    for d in [3, 5]:
+        for p in [0.001, 0.003]:
+            result = run_surgery_experiment(
+                distance=d, r_pre=d, r_merge=d, r_post=d,
+                noise=p, shots=10_000,
+            )
+            ratio = (
+                result.sliding_window_error_rate / result.full_error_rate
+                if result.full_error_rate > 0
+                else float("inf")
+            )
+            print(f"  d={d} p={p} ratio={ratio:.3f}\n")

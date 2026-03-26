@@ -21,6 +21,10 @@ from glue.window_decoding.experiment import (
     run_full_decode,
     run_sliding_window_decode,
     run_experiment,
+    run_surgery_experiment,
     run_sweep,
     print_results_table,
+)
+from glue.window_decoding.lattice_surgery_circuits import (
+    build_merge_split_circuit,
 )
